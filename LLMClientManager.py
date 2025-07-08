@@ -19,15 +19,15 @@ class LLMClientManager:
             timeout=self.config.get("timeout", 60.0)
         )
 
-    def call_text_llm(self, prompt: str) -> str:
-        """Вызов LLM для текстового анализа"""
+    def call_text_llm(self, messages: List[dict]) -> str:
+        """
+        Вызов LLM для текстового анализа с использованием предоставленных сообщений.
+        :param messages: Список сообщений для отправки в LLM
+        """
         return self.text_client.chat.completions.create(
             model=self.config["model"],
-            messages=[
-                {"role": "system", "content": "Ты эксперт по анализу требований"},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=self.config.get("max_tokens", 4000),
+            messages=messages,
+            max_tokens=self.config.get("max_tokens", 8000),
             temperature=self.config.get("temperature", 0.1),
             stop=["<|end_of_text|>", "<|im_end|>"],
             stream=False

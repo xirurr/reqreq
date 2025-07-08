@@ -7,7 +7,7 @@ lm_studio_config = {
     "image_model": "google/gemma-3-4b", # модель анализа изображений
     "embedding_model": "text-embedding-mxbai-embed-large-v1", # модель векторизации текста
     "image_directory": "/parsed/images",  # Директория с изображениями
-    "max_tokens": 4000,
+    "max_tokens": 8000,
     "image_max_tokens": 1000,
     "temperature": 0.1,
     "chunk_size": 3000,
