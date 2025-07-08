@@ -3,7 +3,7 @@ lm_studio_config = {
     "image_api_base": "http://localhost:1234/v1",
     "embedding_api_base": "http://localhost:1234/v1",
     "api_key": "any-string",  # LM Studio не требует реального ключа
-    "model": "qwen/qwen3-8b",  # текстовая модель
+    "model": "qwen/qwen3-4b",  # текстовая модель
     "image_model": "google/gemma-3-4b", # модель анализа изображений
     "embedding_model": "text-embedding-mxbai-embed-large-v1", # модель векторизации текста
     "image_directory": "/parsed/images",  # Директория с изображениями

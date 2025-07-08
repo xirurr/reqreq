@@ -16,7 +16,7 @@ class LLMClientManager:
         return OpenAI(
             base_url=api_base,
             api_key=self.config.get("api_key", "not-needed"),
-            timeout=self.config.get("timeout", 60.0)
+            timeout=self.config.get("timeout", 500.0)
         )
 
     def call_text_llm(self, messages: List[dict]) -> str:
@@ -27,7 +27,7 @@ class LLMClientManager:
         return self.text_client.chat.completions.create(
             model=self.config["model"],
             messages=messages,
-            max_tokens=self.config.get("max_tokens", 8000),
+            max_tokens=self.config.get("max_tokens"),
             temperature=self.config.get("temperature", 0.1),
             stop=["<|end_of_text|>", "<|im_end|>"],
             stream=False
@@ -51,7 +51,7 @@ class LLMClientManager:
                     ]
                 }
             ],
-            max_tokens=self.config.get("image_max_tokens", 1500),
+            max_tokens=self.config.get("image_max_tokens"),
             temperature=0.1
         ).choices[0].message.content
 
@@ -72,5 +72,5 @@ class LLMClientManager:
     def get_image_model_name(self) -> str:
         return self.config["image_model"]
 
-    def get_embedding_model_name(self) -> str:
-        return self.config["embedding_model"]
+    def get_embedding_dim(self) -> int:
+        return 1024
