@@ -1,4 +1,6 @@
-from typing import Tuple, List
+import logging
+from typing import Tuple, List, Union, IO
+import io
 
 from services.CacheService import CacheService
 
@@ -8,7 +10,7 @@ class DocumentProcessor:
         self.temp_dir = temp_dir
         self.cache = cache
 
-    def process_docx(self, file_path: str) -> Tuple[str, List[dict]]:
+    def process_docx(self, file_content: Union[str, IO[bytes]], filename: str) -> Tuple[str, List[dict]]:
         """
         Извлекает текст и информацию о всех изображениях из DOCX файла
         через XML структуру документа
@@ -23,9 +25,13 @@ class DocumentProcessor:
         os.makedirs(output_dir, exist_ok=True)
 
         try:
-            with zipfile.ZipFile(file_path) as docx_zip:
-                filename = os.path.basename(file_path)
-                filename_without_extension = os.path.splitext(os.path.basename(file_path))[0]
+            if isinstance(file_content, str):
+                file_io = open(file_content, 'rb')
+            else:
+                file_io = file_content
+
+            with zipfile.ZipFile(file_io) as docx_zip:
+                filename_without_extension = os.path.splitext(filename)[0]
 
                 # Читаем document.xml
                 doc_xml = docx_zip.read('word/document.xml')
@@ -106,7 +112,8 @@ class DocumentProcessor:
                                 os.remove(full_path)
                                 img_info['saved_path'] = new_path
                             except Exception as e:
-                                print(f"Ошибка конвертации изображения: {str(e)}")
+                                logging.error(f"Error converting image to PNG: {e}", exc_info=True)
+
 
                 # Получаем текст
                 doc_text = "\n".join(self._get_paragraph_content(p, namespaces, images_info)
@@ -116,8 +123,54 @@ class DocumentProcessor:
                 return doc_text, images_info
 
         except Exception as e:
-            print(f"Ошибка при обработке DOCX файла: {str(e)}")
-            return "", []
+            logging.error(f"Failed to process DOCX file {filename}: {e}", exc_info=True)
+            raise
+        finally:
+            if 'file_io' in locals() and not isinstance(file_content, str):
+                file_io.close()
+
+    def process_pdf(self, file_content: Union[str, bytes], filename: str) -> Tuple[str, List[dict]]:
+        import fitz  # PyMuPDF
+        import os
+
+        images_info = []
+        output_dir = "parsed/images"
+        os.makedirs(output_dir, exist_ok=True)
+        filename_without_extension = os.path.splitext(filename)[0]
+        doc_text = ""
+
+        try:
+            if isinstance(file_content, str):
+                doc = fitz.open(file_content)
+            else:
+                doc = fitz.open(stream=file_content, filetype="pdf")
+
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                doc_text += page.get_text()
+                image_list = page.get_images(full=True)
+                for img_index, img in enumerate(image_list):
+                    xref = img[0]
+                    base_image = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    image_ext = base_image["ext"]
+                    image_filename = f"{filename_without_extension}_page{page_num+1}_img{img_index}.{image_ext}"
+                    save_dir = os.path.join(output_dir, filename_without_extension)
+                    os.makedirs(save_dir, exist_ok=True)
+                    save_path = os.path.join(save_dir, image_filename)
+                    with open(save_path, "wb") as f:
+                        f.write(image_bytes)
+                    
+                    img_info = {
+                        'saved_path': save_path,
+                        'description': '' # PyMuPDF doesn't easily extract alt text
+                    }
+                    images_info.append(img_info)
+                    doc_text += f"\n[IMAGE:{save_path}]\n"
+            return doc_text, images_info
+        except Exception as e:
+            logging.error(f"Failed to process PDF file {filename}: {e}", exc_info=True)
+            raise
 
     def _get_paragraph_content(self, paragraph, namespaces, images_info):
         """Извлекает текст и ссылки на изображения из параграфа"""

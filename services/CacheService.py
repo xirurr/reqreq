@@ -1,6 +1,8 @@
 import hashlib
 import json
 import logging
+import pickle
+import struct
 from typing import Any, Optional, Union, List, Dict
 
 import redis
@@ -62,32 +64,27 @@ class CacheService:
             self.logger.error(f"Ошибка записи в кеш для ключа {key}: {str(e)}")
             return False
 
-    def generate_hash(self, *objects) -> str:
-        """
-        Сгенерировать хешсумму от переданных объектов
+    import pickle
 
-        :param objects: Объекты для хеширования
-        :return: SHA-256 хеш в виде строки
+    def generate_hash(self, *args) -> str:
+        """
+        Генерирует детерминированный хеш SHA-256 от любых переданных объектов с помощью pickle.
+
+        :param args: Любое количество объектов для хеширования.
+        :return: Строка с хешем SHA-256.
         """
         try:
-            # Преобразуем все объекты в строки и объединяем
-            hash_input = ""
-            for obj in objects:
-                if isinstance(obj, (dict, list)):
-                    # Для словарей и списков используем JSON с сортировкой ключей
-                    hash_input += json.dumps(obj, sort_keys=True, ensure_ascii=False)
-                else:
-                    # Для остальных типов просто преобразуем в строку
-                    hash_input += str(obj)
-                hash_input += "|"  # Разделитель между объектами
+            # pickle.dumps сериализует практически любой объект Python в байтовую строку.
+            # Используем самый высокий протокол для лучшей эффективности и стабильности.
+            serialized_data = pickle.dumps(args, protocol=pickle.HIGHEST_PROTOCOL)
 
-            # Генерируем SHA-256 хеш
-            hash_object = hashlib.sha256(hash_input.encode('utf-8'))
+            # Вычисляем хеш от сериализованной байтовой строки
+            hash_object = hashlib.sha256(serialized_data)
             return hash_object.hexdigest()
 
         except Exception as e:
-            self.logger.error(f"Ошибка генерации хеша: {str(e)}")
-            raise ValueError(f"Не удалось сгенерировать хеш: {str(e)}")
+            self.logger.error(f"Неожиданная ошибка при генерации хеша с помощью pickle: {e}")
+            raise ValueError(f"Не удалось сгенерировать хеш: {e}")
 
     def exists(self, key: str) -> bool:
         """

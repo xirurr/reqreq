@@ -27,7 +27,7 @@ class LLMClientManager:
         return self.text_client.chat.completions.create(
             model=self.config["model"],
             messages=messages,
-            max_tokens=self.config.get("max_tokens"),
+            # max_tokens=self.config.get("max_tokens"),
             temperature=self.config.get("temperature", 0.1),
             stop=["<|end_of_text|>", "<|im_end|>"],
             stream=False

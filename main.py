@@ -20,30 +20,28 @@ async def analyze_release(release_version: str = Form(...), files: List[UploadFi
     # Корректно объединяем конфигурации
     config = {**lm_studio_config, **services_config}
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        file_paths = []
-        for file in files:
-            file_path = os.path.join(temp_dir, file.filename)
-            with open(file_path, "wb") as buffer:
-                buffer.write(await file.read())
-            file_paths.append(file_path)
+    read_files = []
+    for file in files:
+        content = await file.read()
+        read_files.append({"filename": file.filename, "content": content})
 
-        file_paths.sort()
+    # Сортируем по имени файла
+    read_files.sort(key=lambda x: x['filename'])
 
-        analyzer = UniversalMultimodalAnalyzer(config, release_version, file_paths)
+    analyzer = UniversalMultimodalAnalyzer(config, release_version, read_files)
 
-        print(f"Начало анализа для релиза: {release_version}")
-        try:
-            results = analyzer.analyze()
-        except Exception as e:
-            print("Сломался")
-            print(traceback.format_exc())  # выводит полный traceback
-            raise
-        print("Анализ завершен.")
+    print(f"Начало анализа для релиза: {release_version}")
+    try:
+        results = analyzer.analyze()
+    except Exception as e:
+        print("Сломался")
+        print(traceback.format_exc())  # выводит полный traceback
+        raise
+    print("Анализ завершен.")
 
     return {
         "release_version": release_version,
-        "files_processed": [file.filename for file in files],
+        "files_processed": [file['filename'] for file in read_files],
         "summary": {
             "entities_found": len(results.get("entities", [])),
             "requirements_found": len(results.get("requirements", [])),

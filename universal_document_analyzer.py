@@ -1,3 +1,5 @@
+import io
+import logging
 import os
 import tempfile
 import json
@@ -17,33 +19,40 @@ from services.CacheService import CacheService
 from db_helper import Neo4jWriter
 
 class UniversalMultimodalAnalyzer:
-    def __init__(self, config: dict, release_version: str, file_paths: list):
+    def __init__(self, config: dict, release_version: str, files: list):
         self.config = config
         self.release_version = release_version
-        self.file_paths = file_paths
+        self.files = files
         self.temp_dir = tempfile.mkdtemp()
         self.cache = CacheService()
         self.llm_manager = LLMClientManager(self.config)
+        self.result_processor = ResultProcessor(self.llm_manager)
         self.qdrant_loader = QdrantVectorLoader(self.llm_manager, collection_name=f"reqs_{self.release_version}")
         self.neo4j_writer = Neo4jWriter(uri=config.get("neo4j_uri"), user=config.get("neo4j_user"), password=config.get("neo4j_password"))
 
     def analyze(self) -> dict:
         all_entities = []
         all_requirements = []
+        canonical_entity_names = set()
 
-        for file_path in self.file_paths:
-            print(f"\n--- Обработка файла: {os.path.basename(file_path)} ---")
-            document_text = self._process_file(file_path)
+        for file_data in self.files:
+            filename = file_data['filename']
+            content = file_data['content']
+            print(f"\n--- Обработка файла: {filename} ---")
+            document_text = self._process_file(content, filename)
             chunks = self.split_to_chunks(document_text)
             model_name = self.llm_manager.get_text_model_name()
 
-            entities = self._extract_entities(chunks, model_name, file_path)
+            entities = self._extract_entities(chunks, model_name, filename, canonical_entity_names)
             all_entities.extend(entities)
+            
+            for entity in entities:
+                canonical_entity_names.add(entity['name'])
 
-            requirements = self._extract_requirements(chunks, entities, model_name, file_path)
+            requirements = self._extract_requirements(chunks, entities, model_name, filename)
             all_requirements.extend(requirements)
 
-        final_entities = list({item['name'].lower(): item for item in all_entities}.values())
+        final_entities = self._merge_entities(all_entities)
         unique_reqs = {}
         for i, req in enumerate(all_requirements):
             req_text = req.get("text", "").strip()
@@ -79,38 +88,54 @@ class UniversalMultimodalAnalyzer:
             self.qdrant_loader.cleanup()
             self.neo4j_writer.close()
 
-    def _process_file(self, file_path: str) -> str:
-        ext = os.path.splitext(file_path)[1].lower()
-        document_processor = DocumentProcessor(temp_dir=self.temp_dir, cache=self.cache)
-        if ext == '.docx':
-            text, _ = document_processor.process_docx(file_path)
-        else:
-            raise ValueError(f"Неподдерживаемый формат файла: {ext}")
-        image_processor = ImageProcessor(temp_dir=self.temp_dir, config=self.config, cache=self.cache)
-        return image_processor.process_images_in_text(text)
+    def _process_file(self, file_content: bytes, filename: str) -> str:
+        try:
+            logging.info(f"Starting processing of file: {filename}")
+            ext = os.path.splitext(filename)[1].lower()
+            document_processor = DocumentProcessor(temp_dir=self.temp_dir, cache=self.cache)
+            
+            if ext == '.docx':
+                text, _ = document_processor.process_docx(io.BytesIO(file_content), filename)
+            elif ext == '.pdf':
+                text, _ = document_processor.process_pdf(file_content, filename)
+            else:
+                raise ValueError(f"Unsupported file format: {ext}")
+
+            if not text:
+                logging.warning(f"No text extracted from {filename}")
+
+            image_processor = ImageProcessor(temp_dir=self.temp_dir, config=self.config, cache=self.cache)
+            processed_text = image_processor.process_images_in_text(text)
+            logging.info(f"Successfully processed file: {filename}")
+            return processed_text
+        except Exception as e:
+            logging.error(f"Failed to process file {filename}: {e}", exc_info=True)
+            raise
 
     def _call_llm_with_retry(self, prompt: str, max_retries: int = 2) -> dict:
         messages = [{"role": "user", "content": prompt}]
         for attempt in range(max_retries):
             try:
                 response = self.llm_manager.call_text_llm(messages)
-                parsed = ResultProcessor.extract_json(response)
+                parsed = self.result_processor.extract_json(response)
                 if parsed:  # Успешный парсинг
                     return parsed
-                print(f"  Попытка {attempt + 1}/{max_retries}: Не удалось извлечь JSON, повторяем...")
+                logging.warning(f"Attempt {attempt + 1}/{max_retries}: Failed to extract JSON, retrying...")
             except Exception as e:
-                print(f"  Попытка {attempt + 1}/{max_retries}: Ошибка при вызове LLM или парсинге: {e}")
+                logging.error(f"Attempt {attempt + 1}/{max_retries}: Error calling LLM or parsing: {e}", exc_info=True)
         
-        print(f"  Не удалось получить корректный JSON после {max_retries} попыток.")
-        return {}
+        logging.error(f"Failed to get valid JSON after {max_retries} attempts.")
+        raise RuntimeError(f"Could not get a valid response from LLM after {max_retries} attempts.")
 
-    def _extract_entities(self, chunks: list, model_name: str, source_file: str) -> list:
+    def _extract_entities(self, chunks: list, model_name: str, source_file: str, existing_entity_names: set) -> list:
         extracted_entities = []
         file_name = os.path.basename(source_file)
+        current_known_names = existing_entity_names.copy()
         for i, chunk in enumerate(chunks):
             print(f"  Обработка чанка {i + 1}/{len(chunks)} для сущностей...")
-            prompt = ENTITIES_PROMPT.format(text=chunk)
-            hash_key = f"entities:{self.cache.generate_hash(prompt, model_name)}"
+            entities_list_str = json.dumps(list(current_known_names), ensure_ascii=False, indent=2) if current_known_names else "[]"
+            prompt = ENTITIES_PROMPT.format(text=chunk, existing_entities=entities_list_str)
+            hash_key = f"entities:ch-{i+1}:{self.cache.generate_hash(prompt, model_name)}"
             if self.cache.exists(hash_key):
                 parsed = self.cache.get(hash_key)
             else:
@@ -118,10 +143,12 @@ class UniversalMultimodalAnalyzer:
                 if parsed:
                     self.cache.set(hash_key, parsed)
             
-            for entity in parsed.get("entities", []):
+            chunk_entities = parsed.get("entities", [])
+            for entity in chunk_entities:
                 entity["source_file"] = file_name
                 entity["release_version"] = self.release_version
                 extracted_entities.append(entity)
+                current_known_names.add(entity['name'])
         return extracted_entities
 
     def _extract_requirements(self, chunks: list, entities: list, model_name: str, source_file: str) -> list:
@@ -179,7 +206,7 @@ class UniversalMultimodalAnalyzer:
                     relevant_entities=entities_context_str
                 )
 
-                if len(prompt) > 7000 and len(current_candidates) > 1:
+                if len(prompt) > 8500 and len(current_candidates) > 1:
                     print(f"    -> Батч из {len(current_candidates)} кандидатов слишком большой. Разделяем.")
                     mid = len(current_candidates) // 2
                     part1 = current_candidates[:mid]
@@ -242,3 +269,32 @@ class UniversalMultimodalAnalyzer:
             separators=["\n\n", "\n", ". "]
         )
         return splitter.split_text(document)
+
+    def _merge_entities(self, entities: list) -> list:
+        merged_entities = defaultdict(lambda: {"attributes": [], "states": [], "descriptions": []})
+
+        for entity in entities:
+            key = entity['name'].lower()
+            merged_entities[key]['name'] = entity['name'] # Keep original capitalization
+            if 'description' in entity and entity['description']:
+                merged_entities[key]['descriptions'].append(entity['description'])
+            if 'attributes' in entity:
+                merged_entities[key]['attributes'].extend(entity['attributes'])
+            if 'states' in entity:
+                merged_entities[key]['states'].extend(entity['states'])
+
+        final_list = []
+        for key, value in merged_entities.items():
+            # Combine descriptions, preferring the longest one
+            if value['descriptions']:
+                value['description'] = max(value['descriptions'], key=len)
+            else:
+                value['description'] = ""
+            del value['descriptions']
+
+            # Deduplicate attributes and states
+            value['attributes'] = list({attr['name']: attr for attr in value['attributes']}.values())
+            value['states'] = list({state['name']: state for state in value['states']}.values())
+            final_list.append(value)
+
+        return final_list
