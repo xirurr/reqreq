@@ -27,7 +27,7 @@ class UniversalMultimodalAnalyzer:
         self.cache = CacheService()
         self.llm_manager = LLMClientManager(self.config)
         self.result_processor = ResultProcessor(self.llm_manager)
-        self.qdrant_loader = QdrantVectorLoader(self.llm_manager, collection_name=f"reqs_{self.release_version}")
+        self.qdrant_loader = QdrantVectorLoader(self.llm_manager, collection_name=f"reqs_{self.release_version}", cache=self.cache)
         self.neo4j_writer = Neo4jWriter(uri=config.get("neo4j_uri"), user=config.get("neo4j_user"), password=config.get("neo4j_password"))
 
     def analyze(self) -> dict:
@@ -43,13 +43,16 @@ class UniversalMultimodalAnalyzer:
             chunks = self.split_to_chunks(document_text)
             model_name = self.llm_manager.get_text_model_name()
 
-            entities = self._extract_entities(chunks, model_name, filename, canonical_entity_names)
-            all_entities.extend(entities)
+            entities_from_file = self._extract_entities(chunks, model_name, filename, canonical_entity_names)
+            # Сливаем сущности, найденные в ЭТОМ файле, чтобы убрать дубликаты перед передачей в требования
+            merged_entities_for_file = self._merge_entities(entities_from_file)
+            all_entities.extend(merged_entities_for_file)
             
-            for entity in entities:
+            for entity in merged_entities_for_file:
                 canonical_entity_names.add(entity['name'])
 
-            requirements = self._extract_requirements(chunks, entities, model_name, filename)
+            # Используем очищенный и слитый список сущностей для извлечения требований
+            requirements = self._extract_requirements(chunks, merged_entities_for_file, model_name, filename)
             all_requirements.extend(requirements)
 
         final_entities = self._merge_entities(all_entities)
@@ -93,7 +96,7 @@ class UniversalMultimodalAnalyzer:
             logging.info(f"Starting processing of file: {filename}")
             ext = os.path.splitext(filename)[1].lower()
             document_processor = DocumentProcessor(temp_dir=self.temp_dir, cache=self.cache)
-            
+
             if ext == '.docx':
                 text, _ = document_processor.process_docx(io.BytesIO(file_content), filename)
             elif ext == '.pdf':
@@ -123,7 +126,7 @@ class UniversalMultimodalAnalyzer:
                 logging.warning(f"Attempt {attempt + 1}/{max_retries}: Failed to extract JSON, retrying...")
             except Exception as e:
                 logging.error(f"Attempt {attempt + 1}/{max_retries}: Error calling LLM or parsing: {e}", exc_info=True)
-        
+
         logging.error(f"Failed to get valid JSON after {max_retries} attempts.")
         raise RuntimeError(f"Could not get a valid response from LLM after {max_retries} attempts.")
 
@@ -133,16 +136,17 @@ class UniversalMultimodalAnalyzer:
         current_known_names = existing_entity_names.copy()
         for i, chunk in enumerate(chunks):
             print(f"  Обработка чанка {i + 1}/{len(chunks)} для сущностей...")
-            entities_list_str = json.dumps(list(current_known_names), ensure_ascii=False, indent=2) if current_known_names else "[]"
+            sorted_known_names = sorted(list(current_known_names))
+            entities_list_str = json.dumps(sorted_known_names, ensure_ascii=False, indent=2) if current_known_names else "[]"
             prompt = ENTITIES_PROMPT.format(text=chunk, existing_entities=entities_list_str)
-            hash_key = f"entities:ch-{i+1}:{self.cache.generate_hash(prompt, model_name)}"
+            hash_key = f"entities:{self.cache.generate_hash(prompt, model_name)}"
             if self.cache.exists(hash_key):
                 parsed = self.cache.get(hash_key)
             else:
                 parsed = self._call_llm_with_retry(prompt)
                 if parsed:
                     self.cache.set(hash_key, parsed)
-            
+
             chunk_entities = parsed.get("entities", [])
             for entity in chunk_entities:
                 entity["source_file"] = file_name
@@ -154,7 +158,8 @@ class UniversalMultimodalAnalyzer:
     def _extract_requirements(self, chunks: list, entities: list, model_name: str, source_file: str) -> list:
         extracted_requirements = []
         file_name = os.path.basename(source_file)
-        entities_context = json.dumps({"entities": entities}, indent=2, ensure_ascii=False)
+        sorted_entities = sorted(entities, key=lambda x: x.get('name', ''))
+        entities_context = json.dumps({"entities": sorted_entities}, indent=2, ensure_ascii=False)
         for i, chunk in enumerate(chunks):
             print(f"  Обработка чанка {i + 1}/{len(chunks)} для требований...")
             prompt = REQUIREMENTS_PROMPT.format(text=chunk, entities_context=entities_context)
@@ -176,28 +181,51 @@ class UniversalMultimodalAnalyzer:
         if not requirements:
             return []
 
-        candidate_pairs = self._get_candidate_pairs(requirements, entities)
+        # 1. Получаем пары и СОРТИРУЕМ их, чтобы гарантировать порядок
+        candidate_pairs = sorted(list(self._get_candidate_pairs(requirements, entities)))
+        
         candidates_by_source = defaultdict(list)
         req_map = {req["id"]: req for req in requirements}
+        
         for id1, id2 in candidate_pairs:
             if id1 in req_map and id2 in req_map:
-                candidates_by_source[id1].append(req_map[id2])
+                # Гарантируем, что source всегда меньший из пары для консистентности
+                source_id, target_id = min(id1, id2), max(id1, id2)
+                if source_id in req_map and target_id in req_map:
+                     # Добавляем оба требования в списки друг друга для полной проверки
+                    candidates_by_source[source_id].append(req_map[target_id])
+                    candidates_by_source[target_id].append(req_map[source_id])
+
+        # Убираем дубликаты из списков кандидатов и сортируем их
+        for source_id in candidates_by_source:
+            # Сортируем по ID, чтобы порядок был стабильным
+            unique_candidates = sorted(list({v['id']:v for v in candidates_by_source[source_id]}.values()), key=lambda x: x['id'])
+            candidates_by_source[source_id] = unique_candidates
 
         all_dependencies = []
         model_name = self.llm_manager.get_text_model_name()
         print(f"\nНайдено {len(candidate_pairs)} пар-кандидатов. Группировка в {len(candidates_by_source)} батчей для анализа зависимостей.")
 
-        for i, (source_id, initial_candidates) in enumerate(candidates_by_source.items()):
-            print(f"  Анализ батча {i+1}/{len(candidates_by_source)} для требования {source_id}...")
+        # 2. Итерируемся по батчам в отсортированном по ID порядке
+        sorted_source_ids = sorted(candidates_by_source.keys())
+
+        for i, source_id in enumerate(sorted_source_ids):
+            initial_candidates = candidates_by_source[source_id]
+            print(f"  Анализ батча {i+1}/{len(sorted_source_ids)} для требования {source_id}...")
             source_req = req_map[source_id]
-            
+
+            # 3. Стек теперь тоже будет получать предсказуемо отсортированные данные
             stack = [(initial_candidates, self._get_relevant_entities(requirements, entities, {c['id'] for c in initial_candidates} | {source_id}))]
 
             while stack:
                 current_candidates, current_entities = stack.pop()
-                
-                candidates_list_str = "\n".join([f"- ID: {c['id']}, Текст: \"{c['text']}\"" for c in current_candidates])
-                entities_context_str = json.dumps(current_entities, indent=2, ensure_ascii=False)
+
+                # Сортировка кандидатов и сущностей уже была применена ранее, но для надежности можно повторить
+                sorted_candidates = sorted(current_candidates, key=lambda x: x.get('id', ''))
+                sorted_entities = sorted(current_entities, key=lambda x: x.get('name', ''))
+
+                candidates_list_str = "\n".join([f"- ID: {c['id']}, Текст: \"{c['text']}\"" for c in sorted_candidates])
+                entities_context_str = json.dumps(sorted_entities, indent=2, ensure_ascii=False)
 
                 prompt = BATCH_DEPENDENCY_PROMPT.format(
                     req_a_id=source_id,
@@ -211,10 +239,11 @@ class UniversalMultimodalAnalyzer:
                     mid = len(current_candidates) // 2
                     part1 = current_candidates[:mid]
                     part2 = current_candidates[mid:]
-                    
+
                     entities1 = self._get_relevant_entities(requirements, entities, {c['id'] for c in part1} | {source_id})
                     entities2 = self._get_relevant_entities(requirements, entities, {c['id'] for c in part2} | {source_id})
-                    
+
+                    # Добавляем в стек в обратном порядке для сохранения последовательности
                     stack.append((part2, entities2))
                     stack.append((part1, entities1))
                     continue
@@ -229,7 +258,7 @@ class UniversalMultimodalAnalyzer:
 
                 if parsed and "dependencies" in parsed:
                     all_dependencies.extend(parsed.get("dependencies", []))
-        
+
         return all_dependencies
 
     def _get_candidate_pairs(self, requirements: list, entities: list) -> set:
@@ -244,7 +273,7 @@ class UniversalMultimodalAnalyzer:
                     candidate_pairs.add(tuple(sorted((req["id"], other["id"]))))
 
         entity_names = {e['name'].lower() for e in entities} - common_entity_stopwords
-        req_to_entities = {req['id']: {word for word in re.findall(r'\w+', req['text'].lower()) if word in entity_names} for req in requirements}
+        req_to_entities = {req['id']: {word for word in re.findall(r'\w+', req['text'].lower()) if word in sorted(entity_names)} for req in requirements}
         for r1_id, r2_id in combinations(req_to_entities.keys(), 2):
             if req_to_entities[r1_id] & req_to_entities[r2_id]:
                 candidate_pairs.add(tuple(sorted((r1_id, r2_id))))
@@ -254,7 +283,7 @@ class UniversalMultimodalAnalyzer:
                 for other_req in requirements:
                     if req["id"] != other_req["id"]:
                         candidate_pairs.add(tuple(sorted((req["id"], other_req["id"]))))
-        
+
         return candidate_pairs
 
     def _get_relevant_entities(self, requirements: list, all_entities: list, requirement_ids: set) -> list:
@@ -297,4 +326,5 @@ class UniversalMultimodalAnalyzer:
             value['states'] = list({state['name']: state for state in value['states']}.values())
             final_list.append(value)
 
+        final_list = sorted(final_list, key=lambda x: x.get('name', ''))
         return final_list

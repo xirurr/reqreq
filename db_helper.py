@@ -42,8 +42,8 @@ class Neo4jWriter:
             version_id = str(uuid.uuid4())
             props["version_id"] = version_id
 
-            if 'attributes' in props: props['attributes'] = json.dumps(props['attributes'])
-            if 'states' in props: props['states'] = json.dumps(props['states'])
+            if 'attributes' in props: props['attributes'] = json.dumps(props['attributes'], ensure_ascii=False)
+            if 'states' in props: props['states'] = json.dumps(props['states'], ensure_ascii=False)
 
             res = tx.run("""
                 MERGE (e:Entity {name: $name})
@@ -73,7 +73,7 @@ class Neo4jWriter:
             version_id = str(uuid.uuid4())
             props["version_id"] = version_id
 
-            if 'conditions' in props: props['conditions'] = json.dumps(props['conditions'])
+            if 'conditions' in props: props['conditions'] = json.dumps(props['conditions'], ensure_ascii=False)
 
             res = tx.run("""
                 MERGE (r:Requirement {req_id: $req_id})
@@ -99,14 +99,21 @@ class Neo4jWriter:
     @staticmethod
     def _create_dependencies(tx, dependencies):
         for dep in dependencies:
-            rel_type = dep.get('type', '').strip()
+            # Валидация типа связи, чтобы предотвратить Cypher Injection.
+            # Разрешены только заглавные буквы и подчеркивания.
+            rel_type = dep.get('type', '').strip().upper()
             if not re.match(r'^[A-Z_]+$', rel_type):
+                print(f"--- WARNING: Invalid relationship type skipped: {rel_type} ---")
                 continue
-            tx.run("""
-                MATCH (s_anchor:Requirement {req_id: $source_id})-[:CURRENT_VERSION]->(s_ver:RequirementVersion)
-                MATCH (t_anchor:Requirement {req_id: $target_id})-[:CURRENT_VERSION]->(t_ver:RequirementVersion)
-                MERGE (s_ver)-[:" + rel_type + "]->(t_ver)
-            """, source_id=dep.get('source'), target_id=dep.get('target'))
+
+            # Используем f-string для безопасной вставки типа связи в запрос.
+            # Это необходимо, так как типы связей не могут быть параметризованы.
+            query = f"""
+                MATCH (s_anchor:Requirement {{req_id: $source_id}})-[:CURRENT_VERSION]->(s_ver:RequirementVersion)
+                MATCH (t_anchor:Requirement {{req_id: $target_id}})-[:CURRENT_VERSION]->(t_ver:RequirementVersion)
+                MERGE (s_ver)-[:{rel_type}]->(t_ver)
+            """
+            tx.run(query, source_id=dep.get('source'), target_id=dep.get('target'))
 
     @staticmethod
     def _link_reqs_to_entities(tx, requirements, entities):

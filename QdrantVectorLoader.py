@@ -2,13 +2,15 @@ import uuid
 
 from qdrant_client import QdrantClient, models
 from LLMClientManager import LLMClientManager
+from services.CacheService import CacheService
 
 
 class QdrantVectorLoader:
-    def __init__(self, llm_manager: LLMClientManager, collection_name: str):
+    def __init__(self, llm_manager: LLMClientManager, collection_name: str, cache: CacheService):
         self.client = QdrantClient(host="localhost", port=6333)
         self.llm_manager = llm_manager
         self.collection_name = collection_name
+        self.cache = cache
         embedding_size = self.llm_manager.get_embedding_dim()
         self.client.recreate_collection(
             collection_name=self.collection_name,
@@ -17,9 +19,19 @@ class QdrantVectorLoader:
 
     def load_requirements(self, requirements: list, release_version: str):
         points = []
+        model_name = self.llm_manager.get_embedding_model_name()
+
         for req in requirements:
             if "id" in req and "text" in req:
-                vector = self.llm_manager.call_embedding_llm(req["text"])
+                req_text = req["text"]
+                hash_key = f"embedding:{self.cache.generate_hash(req_text, model_name)}"
+
+                if self.cache.exists(hash_key):
+                    vector = self.cache.get(hash_key)
+                else:
+                    vector = self.llm_manager.call_embedding_llm(req_text)
+                    self.cache.set(hash_key, vector)
+
                 payload = req.copy()
                 payload["release_version"] = release_version
                 payload["id"] = req["id"]
@@ -39,7 +51,15 @@ class QdrantVectorLoader:
 
     def search_requirements(self, text: str, release_version: str, limit: int = 5) -> list:
         """Ищет семантически близкие требования в рамках релиза."""
-        query_vector = self.llm_manager.call_embedding_llm(text)
+        model_name = self.llm_manager.get_embedding_model_name()
+        hash_key = f"embedding:{self.cache.generate_hash(text, model_name)}"
+
+        if self.cache.exists(hash_key):
+            query_vector = self.cache.get(hash_key)
+        else:
+            query_vector = self.llm_manager.call_embedding_llm(text)
+            self.cache.set(hash_key, query_vector)
+
         hits = self.client.search(
             collection_name=self.collection_name,
             query_vector=query_vector,

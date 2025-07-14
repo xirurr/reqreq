@@ -72,5 +72,8 @@ class LLMClientManager:
     def get_image_model_name(self) -> str:
         return self.config["image_model"]
 
+    def get_embedding_model_name(self) -> str:
+        return self.config["embedding_model"]
+
     def get_embedding_dim(self) -> int:
         return 1024

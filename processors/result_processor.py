@@ -29,23 +29,40 @@ class ResultProcessor:
             # If parsing fails, try to fix it with an LLM call
             return self._fix_json_with_llm(json_str)
 
+    def _pre_clean_json_string(self, json_str: str) -> str:
+        """Applies a series of regex fixes for common LLM-induced JSON errors."""
+        # 1. Replace "::" with ":"
+        cleaned_str = re.sub(r'"::"', r'":"', json_str)
+        
+        # 2. Remove newlines within string values
+        # This is complex, so we do it carefully. This looks for a quote, then any characters
+        # that are not a quote, then a newline, and replaces the newline with a space.
+        # It's not perfect but can fix many common cases.
+        cleaned_str = re.sub(r'("[^"\n]*)\n(["^"\n]*)', r'\1 \2', cleaned_str)
+
+        # 3. Fix boolean values that might be in quotes
+        cleaned_str = re.sub(r'"true"', 'true', cleaned_str)
+        cleaned_str = re.sub(r'"false"', 'false', cleaned_str)
+
+        return cleaned_str
+
     def _find_json_string(self, raw_response: str) -> str:
         """Finds the most likely JSON string in the raw text."""
         # 1. Look for a <json> tag first
         json_match = re.search(r"<json>\s*(\{[\s\S]*?\})\s*<\/json>", raw_response, re.DOTALL)
         if json_match:
-            return json_match.group(1)
+            return self._pre_clean_json_string(json_match.group(1))
 
         # 2. Look for a markdown block as a fallback
         json_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", raw_response, re.DOTALL)
         if json_match:
-            return json_match.group(1)
+            return self._pre_clean_json_string(json_match.group(1))
 
         # 3. If not found, remove <think> blocks and find the main JSON object
         cleaned_response = re.sub(r"<think>[\s\S]*?<\/think>", "", raw_response).strip()
         json_match = re.search(r"\{.*\}", cleaned_response, re.DOTALL)
         if json_match:
-            return json_match.group(0)
+            return self._pre_clean_json_string(json_match.group(0))
 
         print(f"--- ERROR: JSON not found in response after cleaning. Original response: ---\n{raw_response}\n-----------------")
         return ""
