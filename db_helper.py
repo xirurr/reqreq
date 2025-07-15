@@ -18,6 +18,33 @@ class Neo4jWriter:
             session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (v:RequirementVersion) REQUIRE v.version_id IS UNIQUE")
             session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (v:EntityVersion) REQUIRE v.version_id IS UNIQUE")
 
+    def get_existing_requirements(self):
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (r:Requirement)-[:CURRENT_VERSION]->(v:RequirementVersion)
+                RETURN r.req_id AS id, v.text AS text
+            """)
+            return [{"id": record["id"], "text": record["text"]} for record in result]
+
+    def get_next_req_id_index(self, category: str) -> int:
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (r:Requirement)
+                WHERE r.req_id STARTS WITH $prefix
+                RETURN r.req_id AS req_id
+            """, prefix=f"REQ-{category}-")
+            
+            max_index = 0
+            for record in result:
+                try:
+                    index_str = record["req_id"].split('-')[-1]
+                    index = int(index_str)
+                    if index > max_index:
+                        max_index = index
+                except (ValueError, IndexError):
+                    continue
+            return max_index + 1
+
     def write_results(self, data: dict, release_version: str):
         with self.driver.session() as session:
             print("Запись сущностей в Neo4j...")

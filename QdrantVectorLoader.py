@@ -2,6 +2,7 @@ import uuid
 
 from qdrant_client import QdrantClient, models
 from LLMClientManager import LLMClientManager
+from models.model_types import ModelType
 from services.CacheService import CacheService
 
 
@@ -19,7 +20,7 @@ class QdrantVectorLoader:
 
     def load_requirements(self, requirements: list, release_version: str):
         points = []
-        model_name = self.llm_manager.get_embedding_model_name()
+        model_name = self.llm_manager.get_model_name(model_type=ModelType.EMBEDDING)
 
         for req in requirements:
             if "id" in req and "text" in req:
@@ -51,7 +52,7 @@ class QdrantVectorLoader:
 
     def search_requirements(self, text: str, release_version: str, limit: int = 5) -> list:
         """Ищет семантически близкие требования в рамках релиза."""
-        model_name = self.llm_manager.get_embedding_model_name()
+        model_name = self.llm_manager.get_model_name(ModelType.EMBEDDING)
         hash_key = f"embedding:{self.cache.generate_hash(text, model_name)}"
 
         if self.cache.exists(hash_key):

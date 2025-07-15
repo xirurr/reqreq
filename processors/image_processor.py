@@ -7,6 +7,7 @@ from io import BytesIO
 from PIL import Image
 
 from LLMClientManager import LLMClientManager
+from models.model_types import ModelType
 from services.CacheService import CacheService
 
 
@@ -41,7 +42,7 @@ class ImageProcessor:
 
         # Проверка кэша
         cache_key = "img:"+self.cache.generate_hash(self._get_file_hash(img_path), caption,
-                                             self.llm_client.get_image_model_name())
+                                             self.llm_client.get_model_name(model_type=ModelType.GRAPHIC))
 
         if self.cache.exists(cache_key):
             return self.cache.get(cache_key)
