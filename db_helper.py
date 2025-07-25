@@ -68,15 +68,18 @@ class Neo4jWriter:
             name = props.pop('name')
             version_id = str(uuid.uuid4())
             props["version_id"] = version_id
+            props["release_version"] = release_version
 
             if 'attributes' in props: props['attributes'] = json.dumps(props['attributes'], ensure_ascii=False)
             if 'states' in props: props['states'] = json.dumps(props['states'], ensure_ascii=False)
+            if 'source_chunk_id' in props: props['source_chunk_id'] = json.dumps(props['source_chunk_id'])
 
             res = tx.run("""
                 MERGE (e:Entity {name: $name})
                 WITH e
                 OPTIONAL MATCH (e)-[r:CURRENT_VERSION]->(previous_version:EntityVersion)
                 CREATE (new_version:EntityVersion $props)
+                SET new_version.timestamp = datetime()
                 CREATE (e)-[:HAS_VERSION]->(new_version)
                 RETURN previous_version, new_version
             """, name=name, props=props)
@@ -126,15 +129,11 @@ class Neo4jWriter:
     @staticmethod
     def _create_dependencies(tx, dependencies):
         for dep in dependencies:
-            # Валидация типа связи, чтобы предотвратить Cypher Injection.
-            # Разрешены только заглавные буквы и подчеркивания.
             rel_type = dep.get('type', '').strip().upper()
             if not re.match(r'^[A-Z_]+$', rel_type):
                 print(f"--- WARNING: Invalid relationship type skipped: {rel_type} ---")
                 continue
 
-            # Используем f-string для безопасной вставки типа связи в запрос.
-            # Это необходимо, так как типы связей не могут быть параметризованы.
             query = f"""
                 MATCH (s_anchor:Requirement {{req_id: $source_id}})-[:CURRENT_VERSION]->(s_ver:RequirementVersion)
                 MATCH (t_anchor:Requirement {{req_id: $target_id}})-[:CURRENT_VERSION]->(t_ver:RequirementVersion)
@@ -157,3 +156,42 @@ class Neo4jWriter:
                         MATCH (e:Entity {name: $entity_name})
                         MERGE (v)-[:CONTAINS_ENTITY]->(e)
                     """, req_id=req_id, entity_name=entity_name.capitalize())
+
+    def get_subgraph_for_nodes(self, node_ids: list, release_version: str, depth: int = 2) -> dict:
+        """Получает подграф для заданных ID узлов в пределах указанной глубины."""
+        with self.driver.session() as session:
+            # Этот запрос получает все пути, исходящие из наших стартовых узлов
+            result = session.run("""
+                MATCH (start_node)
+                WHERE (start_node:Requirement AND start_node.req_id IN $node_ids) OR (start_node:Entity AND start_node.name IN $node_ids)
+                CALL apoc.path.expandConfig(start_node, {
+                    maxLevel: $depth,
+                    uniqueness: 'NODE_GLOBAL'
+                })
+                YIELD path
+                RETURN path
+            """, node_ids=node_ids, depth=depth)
+
+            nodes = {}
+            relationships = []
+
+            for record in result:
+                path = record["path"]
+                for node in path.nodes:
+                    # Проверяем, является ли узел версией и соответствует ли он нашему релизу
+                    if ('RequirementVersion' in node.labels or 'EntityVersion' in node.labels) and node.get('release_version') == release_version:
+                        nodes[node.id] = dict(node.items())
+                
+                for rel in path.relationships:
+                    # Убеждаемся, что обе стороны связи - это узлы нужной нам версии
+                    start_id = rel.start_node.id
+                    end_id = rel.end_node.id
+                    if start_id in nodes and end_id in nodes:
+                        relationships.append({
+                            'source': start_id,
+                            'target': end_id,
+                            'type': rel.type
+                        })
+
+            # Возвращаем только уникальные узлы и связи
+            return {"nodes": list(nodes.values()), "relationships": relationships}

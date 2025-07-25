@@ -9,8 +9,21 @@ from fastapi import FastAPI, UploadFile, File, Form
 from configs.llm_configs import lm_studio_config
 from configs.neo4j_config import services_config
 from universal_document_analyzer import UniversalMultimodalAnalyzer
+from QuestionAnsweringService import QuestionAnsweringService
 
 app = FastAPI()
+
+# ... (существующий эндпоинт analyze_release) ...
+
+@app.post("/ask_test/")
+def ask_test(question: str = Form(...), version: str = Form("latest")):
+    """Тестовый эндпоинт для проверки QuestionAnsweringService."""
+    config = {**lm_studio_config, **services_config}
+    qa_service = QuestionAnsweringService(config)
+    
+    print(f"Получен тестовый запрос: вопрос='{question}', версия='{version}'")
+    response = qa_service.answer_question(question, version)
+    return response
 
 @app.post("/analyze_release/")
 async def analyze_release(release_version: str = Form(...), files: List[UploadFile] = File(...)):
