@@ -326,20 +326,28 @@ class UniversalMultimodalAnalyzer:
             logging.error(f"Failed to process file {filename}: {e}", exc_info=True)
             raise
 
-    def _call_text_llm_with_retry(self, prompt: str, model_type: ModelType, max_retries: int = 2) -> dict:
+    def _call_text_llm_with_retry(self, prompt: str, model_type: ModelType, max_retries: int = 2) -> dict | None:
+        """Вызывает LLM и в режиме чата просит исправить JSON, если он некорректен."""
         messages = [{"role": "user", "content": prompt}]
-        for attempt in range(max_retries):
-            try:
-                response = self.llm_manager.call_text_llm(messages, model_type=model_type)
-                parsed = self.result_processor.extract_json(response)
-                if parsed:
-                    return parsed
-                logging.warning(f"Attempt {attempt + 1}/{max_retries}: Failed to extract JSON, retrying...")
-            except Exception as e:
-                logging.error(f"Attempt {attempt + 1}/{max_retries}: Error calling LLM or parsing: {e}", exc_info=True)
 
-        logging.error(f"Failed to get valid JSON after {max_retries} attempts.")
-        raise RuntimeError(f"Could not get a valid response from LLM after {max_retries} attempts.")
+        for attempt in range(max_retries):
+            response_str = self.llm_manager.call_text_llm(messages, model_type=model_type)
+            parsed_json = self.result_processor.extract_json(response_str)
+
+            if parsed_json:
+                return parsed_json  # Успех!
+
+            logging.warning(f"Attempt {attempt + 1}/{max_retries}: Не удалось извлечь JSON. Просим модель уточнить ответ.")
+
+            # Если не удалось, добавляем сообщения в историю для следующей попытки
+            messages.append({"role": "assistant", "content": response_str})
+            messages.append({
+                "role": "user",
+                "content": "Твой предыдущий ответ не является валидным JSON. Пожалуйста, исправь его и верни **только** JSON-объект, обернутый в теги `<json>` и `</json>`."
+            })
+
+        logging.error(f"Не удалось получить валидный JSON после {max_retries} попыток чата.")
+        return None
 
     def _get_cached_text_llm_response(self, prompt: str, model_type: ModelType, cache_key_prefix: str) -> dict:
         model_name = self.llm_manager.get_model_name(model_type)
@@ -348,10 +356,12 @@ class UniversalMultimodalAnalyzer:
         if self.cache.exists(hash_key):
             return self.cache.get(hash_key)
         else:
+            # Теперь этот метод возвращает готовый словарь или None
             parsed_response = self._call_text_llm_with_retry(prompt, model_type)
             if parsed_response:
                 self.cache.set(hash_key, parsed_response)
-            return parsed_response
+            # Возвращаем словарь или пустой словарь, если был None
+            return parsed_response or {}
 
     def _get_relevant_entities(self, requirements: list, all_entities: list, requirement_ids: set) -> list:
         req_texts = " ".join([req['text'] for req in requirements if req['id'] in requirement_ids])
