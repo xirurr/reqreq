@@ -17,9 +17,8 @@ from processors.document_processor import DocumentProcessor, SafeDocumentProcess
 from processors.image_processor import ImageProcessor
 from processors.result_processor import ResultProcessor
 from models.model_types import ModelType
-from prompts.promts import ENTITIES_PROMPT, REQUIREMENTS_PROMPT, BATCH_DEPENDENCY_PROMPT, REQUIREMENT_CATEGORY_PROMPT
-from services.CacheService import CacheService
-from db_helper import Neo4jWriter
+from prompts.prompt_factory import PromptFactory
+from prompts.prompt_factory import PromptFactory
 
 class UniversalMultimodalAnalyzer:
     def __init__(self, config: dict, release_version: str, files: list):
@@ -33,6 +32,8 @@ class UniversalMultimodalAnalyzer:
         self.qdrant_loader = QdrantVectorLoader(self.llm_manager, cache=self.cache)
         self.neo4j_writer = Neo4jWriter(uri=config.get("neo4j_uri"), user=config.get("neo4j_user"),
                                         password=config.get("neo4j_password"))
+        self.prompt_factory = PromptFactory()
+        self.prompt_factory = PromptFactory()
 
     def analyze(self) -> dict:
         # --- Этап 1: Извлечение данных из документов ---
@@ -141,8 +142,7 @@ class UniversalMultimodalAnalyzer:
             chunk_id = self._generate_chunk_id(file_name, chunk)
             print(f"  Обработка чанка {chunk_id} для сущностей...")
             sorted_known_names = sorted(list(current_known_names))
-            entities_list_str = json.dumps(sorted_known_names, ensure_ascii=False, indent=2) if current_known_names else "[]"
-            prompt = ENTITIES_PROMPT.format(text=chunk, existing_entities=entities_list_str)
+            prompt = self.prompt_factory.get_entities_prompt(text=chunk, existing_entities=sorted_known_names)
             
             parsed = self._get_cached_text_llm_response(prompt, ModelType.DEFAULT_TEXT, "entities")
 
@@ -173,12 +173,12 @@ class UniversalMultimodalAnalyzer:
         # Сортируем "чистые" данные непосредственно перед созданием JSON для кеширования
         prompt_entities.sort(key=lambda x: x.get('name', ''))
 
-        entities_context = json.dumps({"entities": prompt_entities}, indent=2, ensure_ascii=False)
+        entities_context = {"entities": prompt_entities}
 
         for i, chunk in enumerate(chunks):
             chunk_id = self._generate_chunk_id(file_name, chunk)
             print(f"  Обработка чанка {chunk_id}({i + 1}/{len(chunks)}) для требований...")
-            prompt = REQUIREMENTS_PROMPT.format(text=chunk, entities_context=entities_context)
+            prompt = self.prompt_factory.get_requirements_prompt(text=chunk, entities_context=entities_context)
 
             parsed = self._get_cached_text_llm_response(prompt, ModelType.DEFAULT_TEXT, "requirements")
 
@@ -226,13 +226,12 @@ class UniversalMultimodalAnalyzer:
                 sorted_entities = sorted(current_entities, key=lambda x: x.get('name', ''))
 
                 candidates_list_str = "\n".join([f"- ID: {c['id']}, Текст: \"{c['text']}\"" for c in sorted_candidates])
-                entities_context_str = json.dumps(sorted_entities, indent=2, ensure_ascii=False)
-
-                prompt = BATCH_DEPENDENCY_PROMPT.format(
+                
+                prompt = self.prompt_factory.get_batch_dependency_prompt(
                     req_a_id=source_id,
                     req_a_text=source_req['text'],
                     candidates_list=candidates_list_str,
-                    relevant_entities=entities_context_str
+                    relevant_entities=sorted_entities
                 )
 
                 if len(prompt) > 7500 and len(current_candidates) > 1:
@@ -279,9 +278,12 @@ class UniversalMultimodalAnalyzer:
         return candidate_pairs
 
     def _assign_stable_requirement_ids(self, requirements: list) -> list:
-        existing_reqs = self.neo4j_writer.get_existing_requirements()
         if not requirements:
             return []
+
+        existing_reqs = self.neo4j_writer.get_existing_requirements()
+        # Получаем все существующие категории один раз в начале
+        existing_categories = self.neo4j_writer.get_all_categories()
 
         for req in requirements:
             req['temp_id'] = req['id']
@@ -296,7 +298,10 @@ class UniversalMultimodalAnalyzer:
                 if matched_id:
                     req['id'] = matched_id
                 else:
-                    category = self._get_requirement_category(req['text'], ModelType.DEFAULT_TEXT)
+                    category = self._get_requirement_category(req['text'], ModelType.DEFAULT_TEXT, existing_categories)
+                    if category not in existing_categories:
+                        existing_categories.append(category)
+                    
                     next_index = self.neo4j_writer.get_next_req_id_index(category)
                     req['id'] = f"REQ-{category}-{next_index:03d}"
         return requirements
@@ -368,8 +373,8 @@ class UniversalMultimodalAnalyzer:
         relevant_entity_names = {e['name'] for e in all_entities if e['name'].lower() in req_texts.lower()}
         return [e for e in all_entities if e['name'] in relevant_entity_names]
 
-    def _get_requirement_category(self, req_text: str, model_type: ModelType) -> str:
-        prompt = REQUIREMENT_CATEGORY_PROMPT.format(req_text=req_text)
+    def _get_requirement_category(self, req_text: str, model_type: ModelType, existing_categories: list[str]) -> str:
+        prompt = self.prompt_factory.get_requirement_category_prompt(req_text=req_text, existing_categories=existing_categories)
         
         parsed_response = self._get_cached_text_llm_response(prompt, model_type, "req_category")
 

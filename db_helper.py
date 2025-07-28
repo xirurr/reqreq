@@ -45,6 +45,19 @@ class Neo4jWriter:
                     continue
             return max_index + 1
 
+    def get_all_categories(self) -> list[str]:
+        """Возвращает список всех уникальных категорий требований из базы данных."""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (r:Requirement)
+                WHERE r.req_id STARTS WITH 'REQ-'
+                WITH r.req_id as req_id
+                WITH split(req_id, '-')[1] as category
+                RETURN collect(distinct category) as categories
+            """)
+            record = result.single()
+            return record["categories"] if record else []
+
     def write_results(self, data: dict, release_version: str):
         with self.driver.session() as session:
             print("Запись сущностей в Neo4j...")

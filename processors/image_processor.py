@@ -10,7 +10,7 @@ from PIL import Image
 from LLMClientManager import LLMClientManager
 from models.model_types import ModelType
 from services.CacheService import CacheService
-from prompts.promts import UI_IMAGE_PROMPT
+from prompts.prompt_factory import PromptFactory
 from processors.result_processor import ResultProcessor
 
 class ImageProcessor:
@@ -19,8 +19,9 @@ class ImageProcessor:
         self.temp_dir = temp_dir
         self.llm_client = LLMClientManager(config)
         self.cache = cache
-        # Используем ResultProcessor для надежного извлечения JSON
         self.result_processor = ResultProcessor(self.llm_client)
+        # Создаем экземпляр фабрики
+        self.prompt_factory = PromptFactory()
 
     def process_images_in_text(self, text: str) -> str:
         """Находит в тексте маркеры изображений и заменяет их на структурированное описание."""
@@ -65,8 +66,11 @@ class ImageProcessor:
 
         base64_image = self._encode_image(img_path)
         
+        # Генерируем промпт с помощью фабрики
+        prompt_text = self.prompt_factory.get_ui_image_prompt()
+
         # Вызываем LLM с новым, правильным промптом
-        raw_response = self.llm_client.call_graphic_llm(base64_image, UI_IMAGE_PROMPT)
+        raw_response = self.llm_client.call_graphic_llm(base64_image, prompt_text)
         
         # Извлекаем JSON из ответа с помощью ResultProcessor
         description_json = self.result_processor.extract_json(raw_response)
