@@ -7,30 +7,53 @@ class PromptFactory:
     Фабрика для создания системных промптов через типизированные методы.
     """
 
-    def get_entities_prompt(self, text: str, existing_entities: list) -> str:
-        p = self._build_entities_prompt(text, existing_entities)
-        return p.generate()
+    def get_entities_prompt(self, text: str, existing_entities: list) -> BasePrompt:
+        return self._build_entities_prompt(text, existing_entities)
 
-    def get_requirements_prompt(self, text: str, entities_context: dict) -> str:
-        p = self._build_requirements_prompt(text, entities_context)
-        return p.generate()
+    def get_requirements_prompt(self, text: str, entities_context: dict) -> BasePrompt:
+        return self._build_requirements_prompt(text, entities_context)
 
     def get_batch_dependency_prompt(self, req_a_id: str, req_a_text: str, candidates_list: str,
-                                    relevant_entities: dict) -> str:
-        p = self._build_batch_dependency_prompt(req_a_id, req_a_text, candidates_list, relevant_entities)
-        return p.generate()
+                                    relevant_entities: dict) -> BasePrompt:
+        return self._build_batch_dependency_prompt(req_a_id, req_a_text, candidates_list, relevant_entities)
 
-    def get_requirement_category_prompt(self, req_text: str, existing_categories: list) -> str:
-        p = self._build_requirement_category_prompt(req_text, existing_categories)
-        return p.generate()
+    def get_requirement_category_prompt(self, req_text: str, existing_categories: list) -> BasePrompt:
+        return self._build_requirement_category_prompt(req_text, existing_categories)
 
-    def get_ui_image_prompt(self) -> str:
-        p = self._build_ui_image_prompt()
-        return p.generate()
+    def get_ui_image_prompt(self) -> BasePrompt:
+        return self._build_ui_image_prompt()
 
-    def get_qna_prompt(self, question: str, context_graph: dict, enriched_text: str) -> str:
-        p = self._build_qna_prompt(question, context_graph, enriched_text)
-        return p.generate()
+    def get_qna_prompt(self, question: str, context_graph: dict, enriched_text: str) -> BasePrompt:
+        return self._build_qna_prompt(question, context_graph, enriched_text)
+
+    def get_matching_prompt(self, old_reqs: list, new_reqs: list) -> BasePrompt:
+        return self._build_matching_prompt(old_reqs, new_reqs)
+
+    # ===================================================================
+    #                       ПРИВАТНЫЕ МЕТОДЫ-СБОРЩИКИ
+    # ===================================================================
+
+    def _build_matching_prompt(self, old_reqs: list, new_reqs: list) -> BasePrompt:
+        old_reqs_str = json.dumps([{'id': r['id'], 'text': r['text']} for r in old_reqs], ensure_ascii=False, indent=2)
+        new_reqs_str = json.dumps([{'temp_id': r['temp_id'], 'text': r['text']} for r in new_reqs], ensure_ascii=False, indent=2)
+
+        p = BasePrompt()
+        p.role_description = "Твоя задача: Для каждого 'нового' требования найди семантически эквивалентное 'старое' требование."
+        p.instructions = [
+            "Верни JSON объект, где ключ - это 'temp_id' нового требования, а значение - это 'id' старого требования, которому оно соответствует.",
+            "Если для нового требования нет соответствия среди старых, используй `null`."
+        ]
+        p.json_structure = {
+            "TEMP_REQ-001": "REQ-AUTH-005",
+            "TEMP_REQ-002": None
+        }
+        p.context_data = {
+            "Старые требования": old_reqs_str,
+            "Новые требования": new_reqs_str
+        }
+        p.task_description = "ТВОЙ ОТВЕТ (ТОЛЬКО JSON)"
+        p.output_constraints = ["Верни ТОЛЬКО JSON объект без тегов."]
+        return p
 
     # ===================================================================
     #                       ПРИВАТНЫЕ МЕТОДЫ-СБОРЩИКИ

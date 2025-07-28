@@ -67,7 +67,7 @@ class ImageProcessor:
         base64_image = self._encode_image(img_path)
         
         # Генерируем промпт с помощью фабрики
-        prompt_text = self.prompt_factory.get_ui_image_prompt()
+        prompt_text = self.prompt_factory.get_ui_image_prompt().generate()
 
         # Вызываем LLM с новым, правильным промптом
         raw_response = self.llm_client.call_graphic_llm(base64_image, prompt_text)

@@ -1,24 +1,27 @@
+import hashlib
 import io
+import json
 import logging
 import os
-import tempfile
-import json
 import re
+import tempfile
 import uuid
-import hashlib
-from itertools import combinations
 from collections import defaultdict
+from itertools import combinations
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from LLMClientManager import LLMClientManager
 from QdrantVectorLoader import QdrantVectorLoader
+from db_helper import Neo4jWriter
+from models.model_types import ModelType
 from processors.document_processor import DocumentProcessor, SafeDocumentProcessor
 from processors.image_processor import ImageProcessor
 from processors.result_processor import ResultProcessor
-from models.model_types import ModelType
+from prompts.base_prompt import BasePrompt
 from prompts.prompt_factory import PromptFactory
-from prompts.prompt_factory import PromptFactory
+from services.CacheService import CacheService
+
 
 class UniversalMultimodalAnalyzer:
     def __init__(self, config: dict, release_version: str, files: list):
@@ -142,9 +145,9 @@ class UniversalMultimodalAnalyzer:
             chunk_id = self._generate_chunk_id(file_name, chunk)
             print(f"  Обработка чанка {chunk_id} для сущностей...")
             sorted_known_names = sorted(list(current_known_names))
-            prompt = self.prompt_factory.get_entities_prompt(text=chunk, existing_entities=sorted_known_names)
+            prompt_obj = self.prompt_factory.get_entities_prompt(text=chunk, existing_entities=sorted_known_names)
             
-            parsed = self._get_cached_text_llm_response(prompt, ModelType.DEFAULT_TEXT, "entities")
+            parsed = self._get_cached_text_llm_response(prompt_obj, ModelType.DEFAULT_TEXT, "entities")
 
             chunk_entities = parsed.get("entities", [])
             for entity in chunk_entities:
@@ -178,9 +181,9 @@ class UniversalMultimodalAnalyzer:
         for i, chunk in enumerate(chunks):
             chunk_id = self._generate_chunk_id(file_name, chunk)
             print(f"  Обработка чанка {chunk_id}({i + 1}/{len(chunks)}) для требований...")
-            prompt = self.prompt_factory.get_requirements_prompt(text=chunk, entities_context=entities_context)
+            prompt_obj = self.prompt_factory.get_requirements_prompt(text=chunk, entities_context=entities_context)
 
-            parsed = self._get_cached_text_llm_response(prompt, ModelType.DEFAULT_TEXT, "requirements")
+            parsed = self._get_cached_text_llm_response(prompt_obj, ModelType.DEFAULT_TEXT, "requirements")
 
             for req in parsed.get("requirements", []):
                 req["source_file"] = file_name
@@ -227,14 +230,14 @@ class UniversalMultimodalAnalyzer:
 
                 candidates_list_str = "\n".join([f"- ID: {c['id']}, Текст: \"{c['text']}\"" for c in sorted_candidates])
                 
-                prompt = self.prompt_factory.get_batch_dependency_prompt(
+                prompt_obj = self.prompt_factory.get_batch_dependency_prompt(
                     req_a_id=source_id,
                     req_a_text=source_req['text'],
                     candidates_list=candidates_list_str,
                     relevant_entities=sorted_entities
                 )
 
-                if len(prompt) > 7500 and len(current_candidates) > 1:
+                if len(prompt_obj.generate()) > 7500 and len(current_candidates) > 1:
                     print(f"    -> Батч из {len(current_candidates)} кандидатов слишком большой. Разделяем.")
                     mid = len(current_candidates) // 2
                     part1 = current_candidates[:mid]
@@ -245,7 +248,7 @@ class UniversalMultimodalAnalyzer:
                     stack.append((part1, entities1))
                     continue
 
-                parsed = self._get_cached_text_llm_response(prompt, ModelType.SMART_TEXT, "batch_deps")
+                parsed = self._get_cached_text_llm_response(prompt_obj, ModelType.SMART_TEXT, "batch_deps")
 
                 if parsed and "dependencies" in parsed:
                     all_dependencies.extend(parsed.get("dependencies", []))
@@ -288,8 +291,8 @@ class UniversalMultimodalAnalyzer:
         for req in requirements:
             req['temp_id'] = req['id']
 
-        prompt = self._build_matching_prompt(existing_reqs, requirements)
-        match_result = self._get_cached_text_llm_response(prompt, ModelType.SMART_TEXT, "req_matching")
+        prompt_obj = self.prompt_factory.get_matching_prompt(existing_reqs, requirements)
+        match_result = self._get_cached_text_llm_response(prompt_obj, ModelType.SMART_TEXT, "req_matching")
 
         if match_result:
             for req in requirements:
@@ -331,9 +334,9 @@ class UniversalMultimodalAnalyzer:
             logging.error(f"Failed to process file {filename}: {e}", exc_info=True)
             raise
 
-    def _call_text_llm_with_retry(self, prompt: str, model_type: ModelType, max_retries: int = 2) -> dict | None:
+    def _call_text_llm_with_retry(self, prompt_obj: BasePrompt, model_type: ModelType, max_retries: int = 2) -> dict | None:
         """Вызывает LLM и в режиме чата просит исправить JSON, если он некорректен."""
-        messages = [{"role": "user", "content": prompt}]
+        messages = [{"role": "user", "content": prompt_obj.generate()}]
 
         for attempt in range(max_retries):
             response_str = self.llm_manager.call_text_llm(messages, model_type=model_type)
@@ -346,26 +349,32 @@ class UniversalMultimodalAnalyzer:
 
             # Если не удалось, добавляем сообщения в историю для следующей попытки
             messages.append({"role": "assistant", "content": response_str})
-            messages.append({
-                "role": "user",
-                "content": "Твой предыдущий ответ не является валидным JSON. Пожалуйста, исправь его и верни **только** JSON-объект, обернутый в теги `<json>` и `</json>`."
-            })
+            
+            # Создаем новый, более конкретный запрос на исправление
+            retry_prompt = (
+                "Твой предыдущий ответ не является валидным JSON. "
+                "Пожалуйста, исправь его и верни **только** JSON-объект, обернутый в теги `<json>` и `</json>`.\n"
+                "Вот пример правильной структуры JSON, которую я ожидаю:\n"
+                f"```json\n{json.dumps(prompt_obj.json_structure, ensure_ascii=False, indent=2)}\n```"
+            )
+            messages.append({"role": "user", "content": retry_prompt})
 
         logging.error(f"Не удалось получить валидный JSON после {max_retries} попыток чата.")
         return None
 
-    def _get_cached_text_llm_response(self, prompt: str, model_type: ModelType, cache_key_prefix: str) -> dict:
+    def _get_cached_text_llm_response(self, prompt_obj: BasePrompt, model_type: ModelType, cache_key_prefix: str) -> dict:
         model_name = self.llm_manager.get_model_name(model_type)
-        hash_key = f"{cache_key_prefix}:{self.cache.generate_hash(prompt, model_name)}"
+        # Генерируем кеш-ключ на основе полного текста промпта
+        prompt_text = prompt_obj.generate()
+        hash_key = f"{cache_key_prefix}:{self.cache.generate_hash(prompt_text, model_name)}"
 
         if self.cache.exists(hash_key):
             return self.cache.get(hash_key)
         else:
-            # Теперь этот метод возвращает готовый словарь или None
-            parsed_response = self._call_text_llm_with_retry(prompt, model_type)
+            # Передаем весь объект промпта в метод для повторных попыток
+            parsed_response = self._call_text_llm_with_retry(prompt_obj, model_type)
             if parsed_response:
                 self.cache.set(hash_key, parsed_response)
-            # Возвращаем словарь или пустой словарь, если был None
             return parsed_response or {}
 
     def _get_relevant_entities(self, requirements: list, all_entities: list, requirement_ids: set) -> list:
@@ -374,9 +383,9 @@ class UniversalMultimodalAnalyzer:
         return [e for e in all_entities if e['name'] in relevant_entity_names]
 
     def _get_requirement_category(self, req_text: str, model_type: ModelType, existing_categories: list[str]) -> str:
-        prompt = self.prompt_factory.get_requirement_category_prompt(req_text=req_text, existing_categories=existing_categories)
+        prompt_obj = self.prompt_factory.get_requirement_category_prompt(req_text=req_text, existing_categories=existing_categories)
         
-        parsed_response = self._get_cached_text_llm_response(prompt, model_type, "req_category")
+        parsed_response = self._get_cached_text_llm_response(prompt_obj, model_type, "req_category")
 
         try:
             category = parsed_response.get("category", "UNCATEGORIZED").strip().upper().replace(" ", "_")
@@ -384,12 +393,6 @@ class UniversalMultimodalAnalyzer:
         except (AttributeError, KeyError) as e:
             logging.error(f"Failed to get or parse category for requirement: {req_text}. Error: {e}")
             return "UNCATEGORIZED"
-
-    def _build_matching_prompt(self, old_reqs: list, new_reqs: list) -> str:
-        old_reqs_str = json.dumps([{'id': r['id'], 'text': r['text']} for r in old_reqs], ensure_ascii=False, indent=2)
-        new_reqs_str = json.dumps([{'temp_id': r['temp_id'], 'text': r['text']} for r in new_reqs], ensure_ascii=False, indent=2)
-
-        return f"""Ниже даны два списка требований: 'старые' (с существующими ID) и 'новые' (с временными ID).\n\nТвоя задача: Для каждого 'нового' требования найди семантически эквивалентное 'старое' требование.\n\nФормат ответа: Верни JSON объект, где ключ - это 'temp_id' нового требования, а значение - это 'id' старого требования, которому оно соответствует. Если для нового требования нет соответствия среди старых, используй `null`.\n\nСтарые требования:\n{old_reqs_str}\n\nНовые требования:\n{new_reqs_str}\n\nОтвет:\n"""
 
     def split_to_chunks(self, document: str) -> list:
         """Интеллектуальное деление на чанки, сохраняющее блоки описания изображений."""
